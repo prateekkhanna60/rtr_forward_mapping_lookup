@@ -1,0 +1,205 @@
+name: Promote to QA
+
+on:
+  workflow_dispatch:
+    inputs:
+      integration-name:
+        description: Integration name (e.g. invoice-processor)
+        required: true
+        type: string
+      reason:
+        description: Reason / ticket reference (e.g. JIRA-1234)
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  NON_PROD_CLUSTER_NAME: wiley-integration-non-prod
+  SOURCE_NAMESPACE: dev
+  TARGET_NAMESPACE: qa
+  GITOPS_REPO: wiley/camelk-gitops-sample
+
+jobs:
+  promote-to-qa:
+    runs-on: ubuntu-latest
+    environment: ${{ vars.QA_PROMOTION_ENV || 'qa-promotion' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authorize workflow trigger actor
+        shell: bash
+        run: |
+          ACTOR="${{ github.actor }}"
+          ALLOWED_RAW="${{ vars.QA_ALLOWED_ACTORS || '' }}"
+
+          if [ -z "$ALLOWED_RAW" ]; then
+            echo "ERROR: QA allowlist is not configured. Set repository variable QA_ALLOWED_ACTORS (comma-separated usernames)."
+            exit 1
+          fi
+
+          # Normalize by removing spaces and wrapping with commas for exact matching.
+          ALLOWED=$(echo "$ALLOWED_RAW" | tr -d '[:space:]')
+          if [[ ",$ALLOWED," != *",$ACTOR,"* ]]; then
+            echo "ERROR: '$ACTOR' is not allowed to run QA promotion."
+            echo "Allowed actors: $ALLOWED"
+            exit 1
+          fi
+
+          echo "Actor '$ACTOR' is authorized for QA promotion."
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::357542025006:role/GitHubActionsRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Connect to cluster
+        run: aws eks update-kubeconfig --name ${{ env.NON_PROD_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Install kamel CLI
+        run: |
+          KAMEL_VERSION=2.10.0
+          curl -fsSL \
+            https://github.com/apache/camel-k/releases/download/v${KAMEL_VERSION}/camel-k-client-${KAMEL_VERSION}-linux-amd64.tar.gz \
+            | tar -xz -C /tmp
+          sudo mv /tmp/kamel /usr/local/bin/kamel
+          sudo chmod +x /usr/local/bin/kamel
+
+      - name: Verify integration is Running in dev
+        run: |
+          PHASE=$(kubectl get integration "${{ inputs.integration-name }}" \
+            -n "${{ env.SOURCE_NAMESPACE }}" -o jsonpath='{.status.phase}')
+          if [ "$PHASE" != "Running" ]; then
+            echo "ERROR: Integration '${{ inputs.integration-name }}' is in phase '$PHASE' in ${{ env.SOURCE_NAMESPACE }}."
+            echo "It must be Running before promoting to QA."
+            exit 1
+          fi
+          echo "Integration is Running in ${{ env.SOURCE_NAMESPACE }}. Proceeding with QA promotion."
+
+      - name: Capture image being promoted
+        id: image
+        run: |
+          IMAGE=$(kubectl get integration "${{ inputs.integration-name }}" \
+            -n "${{ env.SOURCE_NAMESPACE }}" -o jsonpath='{.status.image}')
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "Promoting image: $IMAGE"
+
+      - name: Export QA overlay from dev
+        run: |
+          mkdir -p /tmp/gitops-qa
+          kamel promote "${{ inputs.integration-name }}" \
+            -n "${{ env.SOURCE_NAMESPACE }}" \
+            --to "${{ env.TARGET_NAMESPACE }}" \
+            --export-gitops-dir /tmp/gitops-qa
+
+      - name: Restructure to GitOps layout
+        run: |
+          NAME="${{ inputs.integration-name }}"
+          DOMAIN_FILE="integrations/${NAME}/integration.properties"
+          DOMAIN="finance"
+
+          if [ -f "$DOMAIN_FILE" ]; then
+            VALUE=$(grep '^domain=' "$DOMAIN_FILE" | cut -d= -f2)
+            if [ -n "$VALUE" ]; then
+              DOMAIN="$VALUE"
+            fi
+          fi
+
+          mkdir -p "/tmp/gitops-structured/integrations/${DOMAIN}/${NAME}"
+          if [ ! -d "/tmp/gitops-qa/${NAME}" ]; then
+            echo "ERROR: Expected exported overlay at /tmp/gitops-qa/${NAME}, but it was not found."
+            ls -la /tmp/gitops-qa || true
+            exit 1
+          fi
+          cp -r "/tmp/gitops-qa/${NAME}/"* "/tmp/gitops-structured/integrations/${DOMAIN}/${NAME}/"
+
+      - name: Open or update QA promotion PR in integrations-gitops
+        id: qa-pr
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          NAME="${{ inputs.integration-name }}"
+          BRANCH="promote/qa/${NAME}"
+          REPO_DIR="/tmp/integrations-gitops"
+
+          if [ -z "$GH_TOKEN" ]; then
+            echo "ERROR: GITOPS_REPO_TOKEN is required"
+            exit 1
+          fi
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ env.GITOPS_REPO }}.git" "$REPO_DIR"
+          cd "$REPO_DIR"
+
+          git checkout -B "$BRANCH"
+          git config user.name "camel-k-bot"
+          git config user.email "camel-k-bot@users.noreply.github.com"
+
+          mkdir -p integrations
+          cp -r /tmp/gitops-structured/integrations/* integrations/
+
+          git add .
+          if git diff --cached --quiet; then
+            echo "No QA promotion changes detected"
+            echo "pull-request-url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          else
+            git commit -m "promote qa: ${NAME}"
+            git push origin "$BRANCH" --force-with-lease
+          fi
+
+          BODY=$(cat <<EOF
+          ## QA Promotion
+
+          | Field | Value |
+          |---|---|
+          | Integration | ${{ inputs.integration-name }} |
+          | Image | ${{ steps.image.outputs.image }} |
+          | Promoted from | ${{ env.SOURCE_NAMESPACE }} namespace |
+          | Triggered by | @${{ github.actor }} |
+          | Reason / Ticket | ${{ inputs.reason }} |
+          | Source commit | ${{ github.repository }}@${{ github.sha }} |
+
+          This PR requires QA approval before merge.
+          After merge, ArgoCD can auto-sync the QA namespace.
+          EOF
+          )
+
+          EXISTING_URL=$(gh pr list \
+            --repo "${{ env.GITOPS_REPO }}" \
+            --base main \
+            --head "$BRANCH" \
+            --state open \
+            --json url \
+            --jq '.[0].url')
+
+          if [ -n "$EXISTING_URL" ] && [ "$EXISTING_URL" != "null" ]; then
+            gh pr edit "$EXISTING_URL" \
+              --repo "${{ env.GITOPS_REPO }}" \
+              --title "promote qa: ${NAME}" \
+              --body "$BODY" \
+              --add-label qa-promotion || true
+            echo "pull-request-url=$EXISTING_URL" >> "$GITHUB_OUTPUT"
+          else
+            NEW_URL=$(gh pr create \
+              --repo "${{ env.GITOPS_REPO }}" \
+              --base main \
+              --head "$BRANCH" \
+              --title "promote qa: ${NAME}" \
+              --body "$BODY")
+            gh pr edit "$NEW_URL" --repo "${{ env.GITOPS_REPO }}" --add-label qa-promotion || true
+            echo "pull-request-url=$NEW_URL" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summary
+        run: |
+          echo "### QA Promotion initiated" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Integration: \\`${{ inputs.integration-name }}\\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: \\`${{ steps.image.outputs.image }}\\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- PR opened: ${{ steps.qa-pr.outputs.pull-request-url }}" >> "$GITHUB_STEP_SUMMARY"

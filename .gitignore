@@ -1,0 +1,23 @@
+# Build artifacts
+target/
+src/
+*.class
+*.jar
+
+# Maven
+.m2/
+dependency-reduced-pom.xml
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Camel JBang
+.camel-jbang

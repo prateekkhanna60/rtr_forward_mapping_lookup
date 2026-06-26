@@ -1,0 +1,219 @@
+name: Promote to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      integration-name:
+        description: Integration name (e.g. invoice-processor)
+        required: true
+        type: string
+      ticket:
+        description: Change ticket / approval reference
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  NON_PROD_CLUSTER_NAME: camelk-integration-eks
+  DEV_NAMESPACE: dev
+  QA_NAMESPACE: qa
+  PROD_NAMESPACE: prod
+  GITOPS_REPO: wiley/camelk-gitops-sample
+
+jobs:
+  promote-to-prod:
+    runs-on: ubuntu-latest
+    environment: ${{ vars.PROD_PROMOTION_ENV || 'prod-promotion' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authorize workflow trigger actor
+        shell: bash
+        run: |
+          ACTOR="${{ github.actor }}"
+          ALLOWED_RAW="${{ vars.PROD_ALLOWED_ACTORS || '' }}"
+
+          if [ -z "$ALLOWED_RAW" ]; then
+            echo "ERROR: Prod allowlist is not configured. Set repository variable PROD_ALLOWED_ACTORS (comma-separated usernames)."
+            exit 1
+          fi
+
+          # Normalize by removing spaces and wrapping with commas for exact matching.
+          ALLOWED=$(echo "$ALLOWED_RAW" | tr -d '[:space:]')
+          if [[ ",$ALLOWED," != *",$ACTOR,"* ]]; then
+            echo "ERROR: '$ACTOR' is not allowed to run production promotion."
+            echo "Allowed actors: $ALLOWED"
+            exit 1
+          fi
+
+          echo "Actor '$ACTOR' is authorized for production promotion."
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::495796280278:role/GitHubActionsRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Connect to cluster
+        run: aws eks update-kubeconfig --name ${{ env.NON_PROD_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Install kamel CLI
+        run: |
+          KAMEL_VERSION=2.10.0
+          curl -fsSL \
+            https://github.com/apache/camel-k/releases/download/v${KAMEL_VERSION}/camel-k-client-${KAMEL_VERSION}-linux-amd64.tar.gz \
+            | tar -xz -C /tmp
+          sudo mv /tmp/kamel /usr/local/bin/kamel
+          sudo chmod +x /usr/local/bin/kamel
+
+      - name: Verify integration is Running in QA
+        run: |
+          PHASE=$(kubectl get integration "${{ inputs.integration-name }}" \
+            -n "${{ env.QA_NAMESPACE }}" -o jsonpath='{.status.phase}')
+          if [ "$PHASE" != "Running" ]; then
+            echo "ERROR: Integration '${{ inputs.integration-name }}' is in phase '$PHASE' in ${{ env.QA_NAMESPACE }}."
+            echo "It must be Running in QA before promoting to prod."
+            exit 1
+          fi
+          echo "Integration is Running in ${{ env.QA_NAMESPACE }}. Proceeding with prod promotion."
+
+      - name: Capture image and QA kit for audit
+        id: image
+        run: |
+          IMAGE=$(kubectl get integration "${{ inputs.integration-name }}" \
+            -n "${{ env.QA_NAMESPACE }}" -o jsonpath='{.status.image}')
+          QA_KIT=$(kubectl get integration "${{ inputs.integration-name }}" \
+            -n "${{ env.QA_NAMESPACE }}" -o jsonpath='{.status.integrationKit.name}')
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "qa_kit=$QA_KIT" >> "$GITHUB_OUTPUT"
+          echo "Promoting image: $IMAGE (IntegrationKit: $QA_KIT)"
+
+      - name: Warn if dev image differs from QA image
+        run: |
+          DEV_IMAGE=$(kubectl get integration "${{ inputs.integration-name }}" \
+            -n "${{ env.DEV_NAMESPACE }}" -o jsonpath='{.status.image}' 2>/dev/null || true)
+          QA_IMAGE="${{ steps.image.outputs.image }}"
+          if [ -n "$DEV_IMAGE" ] && [ "$DEV_IMAGE" != "$QA_IMAGE" ]; then
+            echo "WARNING: QA image ($QA_IMAGE) differs from dev image ($DEV_IMAGE)."
+            echo "You are promoting the QA-tested version, not latest dev."
+          fi
+
+      - name: Export prod overlay from QA
+        run: |
+          mkdir -p /tmp/gitops-prod
+          kamel promote "${{ inputs.integration-name }}" \
+            -n "${{ env.QA_NAMESPACE }}" \
+            --to "${{ env.PROD_NAMESPACE }}" \
+            --export-gitops-dir /tmp/gitops-prod
+
+      - name: Restructure to GitOps layout
+        run: |
+          NAME="${{ inputs.integration-name }}"
+          DOMAIN_FILE="integrations/${NAME}/integration.properties"
+          DOMAIN="finance"
+
+          if [ -f "$DOMAIN_FILE" ]; then
+            VALUE=$(grep '^domain=' "$DOMAIN_FILE" | cut -d= -f2)
+            if [ -n "$VALUE" ]; then
+              DOMAIN="$VALUE"
+            fi
+          fi
+
+          mkdir -p "/tmp/gitops-structured/integrations/${DOMAIN}/${NAME}"
+          if [ ! -d "/tmp/gitops-prod/${NAME}" ]; then
+            echo "ERROR: Expected exported overlay at /tmp/gitops-prod/${NAME}, but it was not found."
+            ls -la /tmp/gitops-prod || true
+            exit 1
+          fi
+          cp -r "/tmp/gitops-prod/${NAME}/"* "/tmp/gitops-structured/integrations/${DOMAIN}/${NAME}/"
+
+      - name: Open or update prod promotion PR in integrations-gitops
+        id: prod-pr
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          NAME="${{ inputs.integration-name }}"
+          BRANCH="promote/prod/${NAME}"
+          REPO_DIR="/tmp/integrations-gitops"
+
+          if [ -z "$GH_TOKEN" ]; then
+            echo "ERROR: GITOPS_REPO_TOKEN is required"
+            exit 1
+          fi
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ env.GITOPS_REPO }}.git" "$REPO_DIR"
+          cd "$REPO_DIR"
+
+          git checkout -B "$BRANCH"
+          git config user.name "camel-k-bot"
+          git config user.email "camel-k-bot@users.noreply.github.com"
+
+          mkdir -p integrations
+          cp -r /tmp/gitops-structured/integrations/* integrations/
+
+          git add .
+          if git diff --cached --quiet; then
+            echo "No prod promotion changes detected"
+            echo "pull-request-url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          else
+            git commit -m "promote prod: ${NAME}"
+            git push origin "$BRANCH" --force-with-lease
+          fi
+
+          BODY=$(cat <<EOF
+          ## Production Promotion
+
+          | Field | Value |
+          |---|---|
+          | Integration | ${{ inputs.integration-name }} |
+          | Image | ${{ steps.image.outputs.image }} |
+          | Promoted from | ${{ env.QA_NAMESPACE }} namespace |
+          | Triggered by | @${{ github.actor }} |
+          | Change ticket | ${{ inputs.ticket }} |
+          | QA IntegrationKit | ${{ steps.image.outputs.qa_kit }} |
+
+          Requires platform and SRE approval before merge.
+          After merge, perform controlled production sync in ArgoCD.
+          EOF
+          )
+
+          EXISTING_URL=$(gh pr list \
+            --repo "${{ env.GITOPS_REPO }}" \
+            --base main \
+            --head "$BRANCH" \
+            --state open \
+            --json url \
+            --jq '.[0].url')
+
+          if [ -n "$EXISTING_URL" ] && [ "$EXISTING_URL" != "null" ]; then
+            gh pr edit "$EXISTING_URL" \
+              --repo "${{ env.GITOPS_REPO }}" \
+              --title "promote prod: ${NAME}" \
+              --body "$BODY" \
+              --add-label prod-promotion || true
+            echo "pull-request-url=$EXISTING_URL" >> "$GITHUB_OUTPUT"
+          else
+            NEW_URL=$(gh pr create \
+              --repo "${{ env.GITOPS_REPO }}" \
+              --base main \
+              --head "$BRANCH" \
+              --title "promote prod: ${NAME}" \
+              --body "$BODY")
+            gh pr edit "$NEW_URL" --repo "${{ env.GITOPS_REPO }}" --add-label prod-promotion || true
+            echo "pull-request-url=$NEW_URL" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summary
+        run: |
+          echo "### Prod Promotion initiated" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Integration: \\`${{ inputs.integration-name }}\\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: \\`${{ steps.image.outputs.image }}\\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- PR: ${{ steps.prod-pr.outputs.pull-request-url }}" >> "$GITHUB_STEP_SUMMARY"

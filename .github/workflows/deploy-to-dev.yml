@@ -1,0 +1,443 @@
+name: Deploy to Dev
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'integrations/**'
+      - 'platform/dev/**'
+      - '.github/workflows/deploy-to-dev.yml'
+  workflow_dispatch:
+    inputs:
+      integration:
+        description: 'Integration name to deploy (optional; omit to auto-detect)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+
+env:
+  OPERATOR_NAMESPACE: camelk-system
+  DEV_NAMESPACE: dev
+  GHCR_REGISTRY: ghcr.io
+  GHCR_IMAGE_REPOSITORY: ghcr.io/wiley/wiley-integration
+  GHCR_SECRET_NAME: ghcr-registry-secret
+  GITOPS_REPO: wiley/camelk-gitops-sample
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: 357542025006
+  NON_PROD_CLUSTER_NAME: wiley-integration-non-prod
+
+jobs:
+  detect-changed-integrations:
+    runs-on: ubuntu-latest
+    outputs:
+      integrations: ${{ steps.detect.outputs.integrations }}
+      has-changes: ${{ steps.detect.outputs.has-changes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed Camel K integrations
+        id: detect
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          MANUAL_INTEGRATION: ${{ inputs.integration }}
+          TRIGGER_EVENT: ${{ github.event_name }}
+        run: |
+          # If manually triggered with an integration name, use that
+          if [ -n "$MANUAL_INTEGRATION" ]; then
+            echo "Manual integration specified: $MANUAL_INTEGRATION"
+            integrations="[\"$MANUAL_INTEGRATION\"]"
+            echo "has-changes=true" >> "$GITHUB_OUTPUT"
+            echo "integrations=$integrations" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # If manually triggered without integration name, default to forwardMappingLookup
+          if [ "$TRIGGER_EVENT" = "workflow_dispatch" ] && [ -z "$MANUAL_INTEGRATION" ]; then
+            echo "Manual trigger without specific integration, defaulting to forwardMappingLookup"
+            integrations="forwardMappingLookup\"]"
+            echo "has-changes=true" >> "$GITHUB_OUTPUT"
+            echo "integrations=$integrations" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          before="${BEFORE}"
+          after="${AFTER}"
+
+          echo "before=$before"
+          echo "after=$after"
+
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+            echo "First commit detected, checking for integrations"
+            if [ -d "integrations" ] && [ "$(ls -A integrations)" ]; then
+              integrations="[\"forwardMappingLookup\"]"  # Default for demo
+            else
+              integrations="[]"
+            fi
+            echo "has-changes=true" >> "$GITHUB_OUTPUT"
+            echo "integrations=$integrations" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Check for changes in integrations/, platform/, or workflow files
+          changed=$(git diff --name-only "$before" "$after" | grep -E '^(integrations/|platform/|\.github/workflows/deploy-to-dev\.yml$)' || true)
+          echo "Changed files: $changed"
+
+          if [ -z "$changed" ]; then
+            echo "has-changes=false" >> "$GITHUB_OUTPUT"
+            echo "integrations=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Extract integration names from changed files
+          integrations=$(printf '%s\n' "$changed" | grep '^integrations/' | awk -F/ '{print $2}' | sort -u | jq -R . | jq -cs .)
+          
+          # If no integrations changed but platform/workflow changed, use default
+          if [ -z "$(echo "$integrations" | jq -r '.[]' 2>/dev/null)" ]; then
+            integrations="[\"forwardMappingLookup\"]"
+          fi
+
+          echo "has-changes=true" >> "$GITHUB_OUTPUT"
+          echo "integrations=$integrations" >> "$GITHUB_OUTPUT"
+
+      - name: Log detected integrations
+        run: |
+          echo "Detected integrations: ${{ steps.detect.outputs.integrations }}"
+          echo "Has changes: ${{ steps.detect.outputs.has-changes }}"
+
+  build-and-deploy:
+    needs: detect-changed-integrations
+    if: needs.detect-changed-integrations.outputs.has-changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        integration: ${{ fromJson(needs.detect-changed-integrations.outputs.integrations) }}
+    steps:
+      # ============================================================
+      # Setup
+      # ============================================================
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::357542025006:role/GitHubActionsRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl kubectl git tar
+
+          KAMEL_VERSION=2.10.0
+          curl -fsSL \
+            https://github.com/apache/camel-k/releases/download/v${KAMEL_VERSION}/camel-k-client-${KAMEL_VERSION}-linux-amd64.tar.gz \
+            | tar -xz -C /tmp
+
+          sudo mv /tmp/kamel /usr/local/bin/kamel
+          sudo chmod +x /usr/local/bin/kamel
+
+          kamel version
+
+      - name: Configure kubectl for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.NON_PROD_CLUSTER_NAME }}
+
+      - name: Verify EKS authentication
+        run: |
+          aws sts get-caller-identity
+          aws eks describe-cluster \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.NON_PROD_CLUSTER_NAME }} \
+            --query 'cluster.arn' \
+            --output text
+          aws eks get-token \
+            --region ${{ env.AWS_REGION }} \
+            --cluster-name ${{ env.NON_PROD_CLUSTER_NAME }} > /dev/null
+
+          if ! kubectl auth can-i get nodes >/dev/null 2>&1; then
+            echo "ERROR: AWS authentication succeeded, but Kubernetes access to cluster '${{ env.NON_PROD_CLUSTER_NAME }}' was denied."
+            echo "Grant arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/GitHubActionsRole cluster access through an EKS Access Entry or aws-auth mapping."
+            exit 1
+          fi
+
+      - name: Verify EKS access
+        run: |
+          kubectl get nodes
+
+          OPERATOR_DEPLOYMENT=""
+          if kubectl get deployment camel-k-operator -n "${{ env.OPERATOR_NAMESPACE }}" >/dev/null 2>&1; then
+            OPERATOR_DEPLOYMENT="camel-k-operator"
+          elif kubectl get deployment camel-k-system-operator -n "${{ env.OPERATOR_NAMESPACE }}" >/dev/null 2>&1; then
+            OPERATOR_DEPLOYMENT="camel-k-system-operator"
+          else
+            echo "ERROR: Camel K operator deployment not found in namespace '${{ env.OPERATOR_NAMESPACE }}'."
+            echo "Expected one of: camel-k-operator, camel-k-system-operator"
+            kubectl get deployment -n "${{ env.OPERATOR_NAMESPACE }}" || true
+            exit 1
+          fi
+
+          echo "Using Camel K operator deployment: $OPERATOR_DEPLOYMENT"
+          kubectl get deployment "$OPERATOR_DEPLOYMENT" -n "${{ env.OPERATOR_NAMESPACE }}"
+          kubectl auth can-i '*' '*'
+
+      - name: Apply dev Camel K platform resources
+        run: |
+          kubectl apply -k platform/dev
+
+          # Validate app routing objects are present in dev namespace.
+          kubectl get svc forwardMappingLookup -n "${{ env.DEV_NAMESPACE }}"
+          kubectl get ingress forwardMappingLookup-ingress -n "${{ env.DEV_NAMESPACE }}"
+          kubectl get endpoints forwardMappingLookup -n "${{ env.DEV_NAMESPACE }}" || true
+
+          kubectl get serviceaccount camel-k-builder \
+            -n "${{ env.DEV_NAMESPACE }}" \
+            -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}'
+          echo
+
+          kubectl get integrationplatform camel-k \
+            -n "${{ env.DEV_NAMESPACE }}" \
+            -o jsonpath='{.spec.build.registry.address} secret={.spec.build.registry.secret}'
+          echo
+
+          ACTUAL_ADDRESS=$(kubectl get integrationplatform camel-k \
+            -n "${{ env.DEV_NAMESPACE }}" \
+            -o jsonpath='{.spec.build.registry.address}')
+
+          EXPECTED_ADDRESS="${{ env.GHCR_IMAGE_REPOSITORY }}"
+
+          if [ "$ACTUAL_ADDRESS" != "$EXPECTED_ADDRESS" ]; then
+            echo "ERROR: IntegrationPlatform registry mismatch."
+            echo "Expected address=$EXPECTED_ADDRESS"
+            echo "Actual   address=$ACTUAL_ADDRESS"
+            kubectl get integrationplatform camel-k -n "${{ env.DEV_NAMESPACE }}" -o yaml || true
+            exit 1
+          fi
+
+      - name: Resolve GHCR credentials
+        run: |
+          set -euo pipefail
+
+          GHCR_USERNAME_SECRET="${{ secrets.GHCR_USERNAME }}"
+          GHCR_TOKEN_SECRET="${{ secrets.GHCR_TOKEN }}"
+
+          if [ -n "$GHCR_USERNAME_SECRET" ] && [ -n "$GHCR_TOKEN_SECRET" ]; then
+            RESOLVED_USERNAME="$GHCR_USERNAME_SECRET"
+            RESOLVED_TOKEN="$GHCR_TOKEN_SECRET"
+            echo "Using GHCR credentials from repository secrets (GHCR_USERNAME/GHCR_TOKEN)."
+          elif [ -z "$GHCR_USERNAME_SECRET" ] && [ -z "$GHCR_TOKEN_SECRET" ]; then
+            RESOLVED_USERNAME="${{ github.actor }}"
+            RESOLVED_TOKEN="${{ secrets.GITHUB_TOKEN }}"
+            echo "GHCR repository secrets not set; falling back to github.actor + GITHUB_TOKEN."
+          else
+            echo "ERROR: GHCR_USERNAME and GHCR_TOKEN must either both be set or both be empty."
+            exit 1
+          fi
+
+          if [ -z "$RESOLVED_USERNAME" ] || [ -z "$RESOLVED_TOKEN" ]; then
+            echo "ERROR: Unable to resolve GHCR credentials."
+            exit 1
+          fi
+
+          echo "::add-mask::$RESOLVED_TOKEN"
+
+          echo "$RESOLVED_TOKEN" | docker login \
+            "${{ env.GHCR_REGISTRY }}" \
+            --username "$RESOLVED_USERNAME" \
+            --password-stdin
+
+          echo "GHCR_USERNAME=$RESOLVED_USERNAME" >> "$GITHUB_ENV"
+          echo "GHCR_TOKEN=$RESOLVED_TOKEN" >> "$GITHUB_ENV"
+
+      - name: Mirror eclipse-temurin base image to GHCR
+        run: |
+          set -euo pipefail
+
+          if [ -z "$GHCR_USERNAME" ] || [ -z "$GHCR_TOKEN" ]; then
+            echo "ERROR: GHCR_USERNAME or GHCR_TOKEN not set. Resolve GHCR credentials step may have failed."
+            exit 1
+          fi
+
+          BASE_IMAGE_SOURCE="eclipse-temurin:17-jdk"
+          BASE_IMAGE_TARGET="${{ env.GHCR_IMAGE_REPOSITORY }}/eclipse-temurin:17-jdk"
+
+          echo "Mirroring base image: $BASE_IMAGE_SOURCE -> $BASE_IMAGE_TARGET"
+          echo "GHCR credentials user: $GHCR_USERNAME"
+
+          # Re-authenticate to ensure push credentials are available
+          echo "::add-mask::$GHCR_TOKEN"
+          echo "$GHCR_TOKEN" | docker login \
+            "${{ env.GHCR_REGISTRY }}" \
+            --username "$GHCR_USERNAME" \
+            --password-stdin
+
+          docker pull "registry-1.docker.io/library/$BASE_IMAGE_SOURCE"
+          docker tag "registry-1.docker.io/library/$BASE_IMAGE_SOURCE" "$BASE_IMAGE_TARGET"
+          
+          echo "Pushing to GHCR..."
+          docker push "$BASE_IMAGE_TARGET" || {
+            echo "Push failed. Verify:"
+            echo "1. GHCR token has write:packages + read:packages permissions"
+            echo "2. Repository path '${{ env.GHCR_IMAGE_REPOSITORY }}' exists and user has access"
+            echo "3. If org requires SSO, token must be authorized for SSO"
+            exit 1
+          }
+
+          echo "Base image mirrored to GHCR: $BASE_IMAGE_TARGET"
+
+      - name: Refresh GHCR registry secret for Camel K build
+        run: |
+          kubectl create secret docker-registry "${{ env.GHCR_SECRET_NAME }}" \
+            -n "${{ env.DEV_NAMESPACE }}" \
+            --docker-server="${{ env.GHCR_REGISTRY }}" \
+            --docker-username="$GHCR_USERNAME" \
+            --docker-password="$GHCR_TOKEN" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl get secret "${{ env.GHCR_SECRET_NAME }}" -n "${{ env.DEV_NAMESPACE }}" -o name
+
+      # ============================================================
+      # Deploy through Camel K managed build
+      # ============================================================
+      - name: Set integration variables
+        id: vars
+        run: |
+          INTEGRATION="${{ matrix.integration }}"
+          echo "integration=$INTEGRATION" >> "$GITHUB_OUTPUT"
+
+      - name: Check if integration code changed
+        id: check_changes
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          INTEGRATION="${{ steps.vars.outputs.integration }}"
+          TRIGGER_EVENT="${{ github.event_name }}"
+          
+          # Always build on manual trigger
+          if [ "$TRIGGER_EVENT" = "workflow_dispatch" ]; then
+            echo "Manual trigger detected, will build"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          before="${BEFORE}"
+          after="${AFTER}"
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+            echo "No valid BEFORE SHA, will build"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          # Rebuild when integration source, dev platform config, or this workflow changes.
+          if git diff --quiet "$before" "$after" -- "integrations/$INTEGRATION/" "platform/dev/" ".github/workflows/deploy-to-dev.yml"; then
+            echo "Integration '$INTEGRATION' unchanged, skipping build"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Integration '$INTEGRATION' or deployment config changed, will build"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate Integration manifest and push to GitOps
+        if: steps.check_changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          INTEGRATION="${{ steps.vars.outputs.integration }}"
+
+          mapfile -t ROUTE_FILES < <(find "integrations/$INTEGRATION" -maxdepth 1 -name "*.java" -type f | sort)
+
+          if [ "${#ROUTE_FILES[@]}" -eq 0 ]; then
+            echo "ERROR: No Java route file found for $INTEGRATION"
+            exit 1
+          fi
+
+          echo "Generating Integration manifest: ${ROUTE_FILES[*]}"
+
+          # Generate the Integration CRD manifest without deploying to the cluster
+          kamel run --output yaml \
+            "${ROUTE_FILES[@]}" \
+            --name "$INTEGRATION" \
+            -n "${{ env.DEV_NAMESPACE }}" \
+            --trait service.enabled=true \
+            --trait security-context.enabled=false \
+            > /tmp/integration-manifest.yaml
+
+          echo "--- Generated manifest ---"
+          cat /tmp/integration-manifest.yaml
+          echo "-------------------------"
+
+          # Resolve domain from integration.properties (defaults to 'default')
+          DOMAIN="default"
+          PROPS_FILE="integrations/$INTEGRATION/integration.properties"
+          if [ -f "$PROPS_FILE" ]; then
+            VALUE=$(grep '^domain=' "$PROPS_FILE" | cut -d= -f2 | tr -d '[:space:]')
+            [ -n "$VALUE" ] && DOMAIN="$VALUE"
+          fi
+          echo "Domain: $DOMAIN"
+
+          if [ -z "$GH_TOKEN" ]; then
+            echo "ERROR: GITOPS_REPO_TOKEN secret is required to push to the GitOps repository."
+            exit 1
+          fi
+
+          REPO_DIR="/tmp/camelk-gitops"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ env.GITOPS_REPO }}.git" "$REPO_DIR"
+          cd "$REPO_DIR"
+          git config user.name "camel-k-bot"
+          git config user.email "camel-k-bot@users.noreply.github.com"
+
+          TARGET_DIR="integrations/${DOMAIN}/${INTEGRATION}/base"
+          mkdir -p "$TARGET_DIR"
+          cp /tmp/integration-manifest.yaml "${TARGET_DIR}/integration.yaml"
+
+          git add .
+          if git diff --cached --quiet; then
+            echo "Integration manifest unchanged, no GitOps push needed."
+          else
+            git commit -m "deploy dev: ${INTEGRATION} (${GITHUB_SHA::8})"
+            git push origin HEAD:main
+            echo "Manifest pushed to ${{ env.GITOPS_REPO }}/${TARGET_DIR}/integration.yaml"
+            echo "Argo CD will sync, then Camel K will build and push images to ${{ env.GHCR_IMAGE_REPOSITORY }}"
+
+            echo "Waiting for Argo CD sync to create Integration '$INTEGRATION' in namespace '${{ env.DEV_NAMESPACE }}'..."
+            for i in {1..60}; do
+              PHASE=$(kubectl get integration "$INTEGRATION" -n "${{ env.DEV_NAMESPACE }}" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+              DEPLOY_IMAGE=$(kubectl get integration "$INTEGRATION" -n "${{ env.DEV_NAMESPACE }}" -o jsonpath='{.status.image}' 2>/dev/null || true)
+
+              if [ "$PHASE" = "Running" ]; then
+                if [ -n "$DEPLOY_IMAGE" ] && [[ "$DEPLOY_IMAGE" == "${{ env.GHCR_IMAGE_REPOSITORY }}"/* ]]; then
+                  echo "Integration '$INTEGRATION' is Running with image $DEPLOY_IMAGE"
+                  break
+                fi
+              fi
+
+              if [ "$i" -eq 60 ]; then
+                echo "ERROR: Integration '$INTEGRATION' did not become Running after GitOps push."
+                kubectl get integration "$INTEGRATION" -n "${{ env.DEV_NAMESPACE }}" -o yaml || true
+                kubectl get events -n "${{ env.DEV_NAMESPACE }}" --sort-by=.lastTimestamp | tail -n 20 || true
+                exit 1
+              fi
+
+              sleep 10
+            done
+          fi
+
+      - name: Skip deployment notification
+        if: steps.check_changes.outputs.changed == 'false'
+        run: |
+          INTEGRATION="${{ steps.vars.outputs.integration }}"
+          echo "Integration '$INTEGRATION' unchanged, no GitOps push needed."
+
